@@ -1,58 +1,50 @@
 # -*- coding:utf-8 -*-
 # Author: hankcs
 # Date: 2019-08-26 15:02
+import contextlib
 import glob
+import gzip
 import json
+import logging
 import os
-import pickle
 import platform
 import random
+import shlex
 import shutil
 import sys
-from sys import exit
-from contextlib import contextmanager
+import tarfile
 import tempfile
-import time
 import urllib
 import zipfile
-import tarfile
-from typing import Dict, Tuple, Optional
+from contextlib import contextmanager
+from pathlib import Path
+from subprocess import Popen, PIPE
+from typing import Tuple, Optional, Union, List
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
-from pathlib import Path
-import numpy as np
 
-from hanlp.utils import time_util
-from hanlp.utils.log_util import logger
+from hanlp_downloader import Downloader
+from hanlp_downloader.log import DownloadCallback
+from pkg_resources import parse_version
+
+import hanlp
+from hanlp_common.constant import HANLP_URL, HANLP_VERBOSE
+from hanlp.utils.log_util import logger, cprint, remove_color_tag
 from hanlp.utils.string_util import split_long_sentence_into
-from hanlp.utils.time_util import now_filename
-from hanlp.common.constant import HANLP_URL
-from hanlp import version
+from hanlp.utils.time_util import now_filename, CountdownTimer
+from hanlp.version import __version__
+from hanlp_common.io import eprint
 
 
-def save_pickle(item, path):
-    with open(path, 'wb') as f:
-        pickle.dump(item, f)
-
-
-def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
-
-
-def save_json(item: dict, path: str, ensure_ascii=False, cls=None, default=lambda o: repr(o)):
-    with open(path, 'w', encoding='utf-8') as out:
-        json.dump(item, out, ensure_ascii=ensure_ascii, indent=2, cls=cls, default=default)
-
-
-def load_json(path):
-    with open(path, encoding='utf-8') as src:
-        return json.load(src)
-
-
-def filename_is_json(filename):
-    filename, file_extension = os.path.splitext(filename)
-    return file_extension in ['.json', '.jsonl']
+def load_jsonl(path, verbose=False):
+    if verbose:
+        src = TimingFileIterator(path)
+    else:
+        src = open(path, encoding='utf-8')
+    for line in src:
+        yield json.loads(line)
+    if not verbose:
+        src.close()
 
 
 def make_debug_corpus(path, delimiter=None, percentage=0.1, max_samples=100):
@@ -98,30 +90,8 @@ def tempdir_human():
     return tempdir(now_filename())
 
 
-class NumpyEncoder(json.JSONEncoder):
-    """
-    Special json encoder for numpy types
-    See https://interviewbubble.com/typeerror-object-of-type-float32-is-not-json-serializable/
-    """
-
-    def default(self, obj):
-        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
-                            np.int16, np.int32, np.int64, np.uint8,
-                            np.uint16, np.uint32, np.uint64)):
-            return int(obj)
-        elif isinstance(obj, (np.float_, np.float16, np.float32,
-                              np.float64)):
-            return float(obj)
-        elif isinstance(obj, (np.ndarray,)):  #### This is the fix
-            return obj.tolist()
-        return json.JSONEncoder.default(self, obj)
-
-
 def hanlp_home_default():
-    """
-
-    :return: default data directory depending on the platform and environment variables
-    """
+    """Default data directory depending on the platform and environment variables"""
     if windows():
         return os.path.join(os.environ.get('APPDATA'), 'hanlp')
     else:
@@ -134,9 +104,19 @@ def windows():
 
 
 def hanlp_home():
-    """
+    """ Home directory for HanLP resources.
 
-    :return: data directory in the filesystem for storage, for example when downloading models
+    Returns:
+        Data directory in the filesystem for storage, for example when downloading models.
+
+    This home directory can be customized with the following shell command or equivalent environment variable on Windows
+    systems.
+
+    .. highlight:: bash
+    .. code-block:: bash
+
+        $ export HANLP_HOME=/data/hanlp
+
     """
     return os.getenv('HANLP_HOME', hanlp_home_default())
 
@@ -150,66 +130,59 @@ def remove_file(filename):
         os.remove(filename)
 
 
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-
 def parent_dir(path):
     return os.path.normpath(os.path.join(path, os.pardir))
 
 
-def download(url, save_path=None, save_dir=hanlp_home(), prefix=HANLP_URL, append_location=True):
+def download(url, save_path=None, save_dir=hanlp_home(), prefix=HANLP_URL, append_location=True, verbose=HANLP_VERBOSE):
     if not save_path:
         save_path = path_from_url(url, save_dir, prefix, append_location)
     if os.path.isfile(save_path):
-        eprint('Using local {}, ignore {}'.format(save_path, url))
+        if verbose:
+            eprint('Using local {}, ignore {}'.format(save_path, url))
         return save_path
     else:
         makedirs(parent_dir(save_path))
-        eprint('Downloading {} to {}'.format(url, save_path))
+        if verbose:
+            eprint('Downloading {} to {}'.format(url, save_path))
         tmp_path = '{}.downloading'.format(save_path)
         remove_file(tmp_path)
         try:
-            def reporthook(count, block_size, total_size):
-                global start_time, progress_size
-                if count == 0:
-                    start_time = time.time()
-                    progress_size = 0
-                    return
-                duration = time.time() - start_time
-                duration = max(1e-8, duration)
-                progress_size = int(count * block_size)
-                if progress_size > total_size:
-                    progress_size = total_size
-                speed = int(progress_size / duration)
-                ratio = progress_size / total_size
-                ratio = max(1e-8, ratio)
-                percent = ratio * 100
-                eta = duration / ratio * (1 - ratio)
-                speed = human_bytes(speed)
-                progress_size = human_bytes(progress_size)
-                sys.stderr.write("\r%.2f%%, %s/%s, %s/s, ETA %s      " %
-                                 (percent, progress_size, human_bytes(total_size), speed,
-                                  time_util.report_time_delta(eta)))
-                sys.stderr.flush()
-
-            import socket
-            socket.setdefaulttimeout(10)
-            opener = urllib.request.build_opener()
-            opener.addheaders = [('User-agent', f'HanLP/{version.__version__}')]
-            urllib.request.install_opener(opener)
-            urlretrieve(url, tmp_path, reporthook)
-            eprint()
+            downloader = Downloader(url, tmp_path, 4, headers={
+                'User-agent': f'HanLP/{__version__} ({platform.platform()})'})
+            if verbose:
+                downloader.subscribe(DownloadCallback(show_header=False))
+            downloader.start_sync()
         except BaseException as e:
             remove_file(tmp_path)
-            hints_for_download = ''
             url = url.split('#')[0]
-            if not windows():
-                hints_for_download = f'e.g. \nwget {url} -O {save_path}\n'
-            eprint(f'Failed to download {url} due to {repr(e)}. Please download it to {save_path} by yourself. '
-                   f'{hints_for_download}'
-                   f'Or consider upgrading to a new version.\npip install -U hanlp')
-            exit(1)
+            try:
+                installed_version, latest_version = check_outdated()
+            except:
+                installed_version, latest_version = None, None  # No Internet
+            if installed_version != latest_version:
+                # Always prompt user to upgrade whenever a new version is available
+                hints = f'[green]Please upgrade to the latest version ({latest_version}) with:[/green]' \
+                        f'\n\n\t[yellow]pip install -U hanlp[/yellow]\n'
+            else:  # Otherwise, prompt user to re-try
+                hints = f'[green]Please re-try or download it to {save_path} by yourself '
+                if not windows():
+                    hints += f'with:[/green]\n\n\t[yellow]wget {url} -O {save_path}[/yellow]\n\n'
+                else:
+                    hints += 'using some decent downloading tools.[/green]\n'
+                if not url.startswith(HANLP_URL):
+                    hints += 'For third party data, unrestricted connectivity to the global network may be required.'
+                else:
+                    hints += 'See also https://hanlp.hankcs.com/docs/install.html#install-models for instructions.'
+            message = f'Download failed due to [red]{repr(e)}[/red].\n' \
+                      f'{hints}'
+            if verbose:
+                cprint(message)
+            if hasattr(e, 'msg'):
+                e.msg += '\n' + remove_color_tag(message)
+            elif hasattr(e, 'args') and e.args and isinstance(e.args, tuple) and isinstance(e.args[0], str):
+                e.args = (e.args[0] + '\n' + remove_color_tag(message),) + e.args[1:]
+            raise e from None
         remove_file(save_path)
         os.rename(tmp_path, save_path)
     return save_path
@@ -217,59 +190,73 @@ def download(url, save_path=None, save_dir=hanlp_home(), prefix=HANLP_URL, appen
 
 def parse_url_path(url):
     parsed: urllib.parse.ParseResult = urlparse(url)
-    path = os.path.join(*parsed.path.strip('/').split('/'))
+    path = parsed.path.strip('/')
     return parsed.netloc, path
 
 
-def uncompress(path, dest=None, remove=True):
-    """
-    uncompress a file
+def uncompress(path, dest=None, remove=True, verbose=HANLP_VERBOSE):
+    """Uncompress a file and clean up uncompressed files once an error is triggered.
 
-    Parameters
-    ----------
-    path
-        The path to a compressed file
-    dest
-        The dest folder
-    remove
-        Remove compressed file after unzipping
-    Returns
-    -------
-        The folder which contains the unzipped content if the zip contains multiple files,
-        otherwise the path to the unique file
+    Args:
+      path: The path to a compressed file
+      dest: The dest folder.
+      remove: Remove archive file after decompression.
+      verbose: ``True`` to print log message.
+
+    Returns:
+        Destination path.
+    
     """
     # assert path.endswith('.zip')
-    prefix, ext = os.path.splitext(path)
+    prefix, ext = split_if_compressed(path)
     folder_name = os.path.basename(prefix)
     file_is_zip = ext == '.zip'
     root_of_folder = None
-    with zipfile.ZipFile(path, "r") if ext == '.zip' else tarfile.open(path, 'r:*') as archive:
+    if ext == '.gz':
         try:
-            if not dest:
-                namelist = sorted(archive.namelist() if file_is_zip else archive.getnames())
-                root_of_folder = namelist[0].strip('/') if len(
-                    namelist) > 1 else ''  # only one file, root_of_folder = ''
-                if all(f.split('/')[0] == root_of_folder for f in namelist[1:]) or not root_of_folder:
-                    dest = os.path.dirname(path)  # only one folder, unzip to the same dir
-                else:
-                    root_of_folder = None
-                    dest = prefix  # assume zip contains more than one files or folders
-            eprint('Extracting {} to {}'.format(path, dest))
-            archive.extractall(dest)
-            if root_of_folder:
-                if root_of_folder != folder_name:
-                    # move root to match folder name
-                    os.rename(path_join(dest, root_of_folder), path_join(dest, folder_name))
-                dest = path_join(dest, folder_name)
-            elif len(namelist) == 1:
-                dest = path_join(dest, namelist[0])
-        except (RuntimeError, KeyboardInterrupt) as e:
-            remove = False
-            if os.path.exists(dest):
-                if os.path.isfile(dest):
-                    os.remove(dest)
-                else:
-                    shutil.rmtree(dest)
+            with gzip.open(path, 'rb') as f_in, open(prefix, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        except Exception as e:
+            remove_file(prefix)
+            remove_file(path)
+            raise e
+    else:
+        try:
+            with zipfile.ZipFile(path, "r") if ext == '.zip' else tarfile.open(path, 'r:*') as archive:
+                if not dest:
+                    namelist = sorted(archive.namelist() if file_is_zip else archive.getnames())
+                    if namelist[0] == '.':
+                        namelist = namelist[1:]
+                        namelist = [p[len('./'):] if p.startswith('./') else p for p in namelist]
+                    if ext == '.tgz':
+                        roots = set(x.split('/')[0] for x in namelist)
+                        if len(roots) == 1:
+                            root_of_folder = next(iter(roots))
+                    else:
+                        # only one file, root_of_folder = ''
+                        root_of_folder = namelist[0].strip('/') if len(namelist) > 1 else ''
+                    if all(f.split('/')[0] == root_of_folder for f in namelist[1:]) or not root_of_folder:
+                        dest = os.path.dirname(path)  # only one folder, unzip to the same dir
+                    else:
+                        root_of_folder = None
+                        dest = prefix  # assume zip contains more than one file or folder
+                if verbose:
+                    eprint('Decompressing {} to {}'.format(path, dest))
+                archive.extractall(dest)
+                if root_of_folder:
+                    if root_of_folder != folder_name:
+                        # move root to match folder name
+                        os.rename(path_join(dest, root_of_folder), path_join(dest, folder_name))
+                    dest = path_join(dest, folder_name)
+                elif len(namelist) == 1:
+                    dest = path_join(dest, namelist[0])
+        except Exception as e:
+            remove_file(path)
+            if os.path.exists(prefix):
+                if os.path.isfile(prefix):
+                    os.remove(prefix)
+                elif os.path.isdir(prefix):
+                    shutil.rmtree(prefix)
             raise e
     if remove:
         remove_file(path)
@@ -277,20 +264,35 @@ def uncompress(path, dest=None, remove=True):
 
 
 def split_if_compressed(path: str, compressed_ext=('.zip', '.tgz', '.gz', 'bz2', '.xz')) -> Tuple[str, Optional[str]]:
-    root, ext = os.path.splitext(path)
-    if ext in compressed_ext:
+    tar_gz = '.tar.gz'
+    if path.endswith(tar_gz):
+        root, ext = path[:-len(tar_gz)], tar_gz
+    else:
+        root, ext = os.path.splitext(path)
+    if ext in compressed_ext or ext == tar_gz:
         return root, ext
     return path, None
 
 
-def get_resource(path: str, save_dir=None, extract=True, prefix=HANLP_URL, append_location=True):
+def get_resource(path: str, save_dir=hanlp_home(), extract=True, prefix=HANLP_URL, append_location=True,
+                 verbose=HANLP_VERBOSE):
+    """Fetch real (local) path for a resource (model, corpus, whatever) to ``save_dir``.
+
+    Args:
+      path: A local path (which will returned as is) or a remote URL (which will be downloaded, decompressed then
+        returned).
+      save_dir: Where to store the resource (Default value = :meth:`hanlp.utils.io_util.hanlp_home`)
+      extract: Whether to unzip it if it's a zip file (Default value = True)
+      prefix: A prefix when matched with an URL (path), then that URL is considered to be official. For official
+        resources, they will not go to a folder called ``thirdparty`` under :const:`~hanlp_common.constants.HANLP_HOME`.
+      append_location: Whether to put unofficial files in a ``thirdparty`` folder.
+      verbose: Whether to print log messages.
+
+    Returns:
+      The real path to the resource.
+
     """
-    Fetch real path for a resource (model, corpus, whatever)
-    :param path: the general path (can be a url or a real path)
-    :param extract: whether to unzip it if it's a zip file
-    :param save_dir:
-    :return: the real path to the resource
-    """
+    path = hanlp.pretrained.ALL.get(path, path)
     anchor: str = None
     compressed = None
     if os.path.isdir(path):
@@ -309,7 +311,10 @@ def get_resource(path: str, save_dir=None, extract=True, prefix=HANLP_URL, appen
                 # indicates the folder name has to be polished
                 anchor = anchor.lstrip('/')
                 parts = anchor.split('/')
-                realpath = str(Path(realpath).parent.joinpath(parts[0]))
+                renamed_realpath = str(Path(realpath).parent.joinpath(parts[0]))
+                if os.path.isfile(realpath + compressed):
+                    os.rename(realpath + compressed, renamed_realpath + compressed)
+                realpath = renamed_realpath
                 anchor = '/'.join(parts[1:])
             child = path_join(realpath, anchor)
             if os.path.exists(child):
@@ -317,24 +322,23 @@ def get_resource(path: str, save_dir=None, extract=True, prefix=HANLP_URL, appen
         elif os.path.isdir(realpath) or (os.path.isfile(realpath) and (compressed and extract)):
             return realpath
         else:
-            pattern = realpath + '*'
-            files = glob.glob(pattern)
-            zip_path = realpath + compressed
-            if extract and zip_path in files:
-                files.remove(zip_path)
-            if files:
-                if len(files) > 1:
-                    logger.debug(f'Found multiple files with {pattern}, will use the first one.')
-                return files[0]
+            if compressed:
+                pattern = realpath + '.*'
+                files = glob.glob(pattern)
+                files = list(filter(lambda x: not x.endswith('.downloading') and not x.endswith(compressed), files))
+                if files:
+                    if len(files) > 1:
+                        logger.debug(f'Found multiple files with {pattern}, will use the first one.')
+                    return files[0]
         # realpath is where its path after exaction
         if compressed:
             realpath += compressed
         if not os.path.isfile(realpath):
-            path = download(url=path, save_path=realpath)
+            path = download(url=path, save_path=realpath, verbose=verbose)
         else:
             path = realpath
     if extract and compressed:
-        path = uncompress(path)
+        path = uncompress(path, verbose=verbose)
         if anchor:
             path = path_join(path, anchor)
 
@@ -342,6 +346,17 @@ def get_resource(path: str, save_dir=None, extract=True, prefix=HANLP_URL, appen
 
 
 def path_from_url(url, save_dir=hanlp_home(), prefix=HANLP_URL, append_location=True):
+    """Map a URL to a local path.
+
+    Args:
+        url: Remote URL.
+        save_dir: The root folder to save this file.
+        prefix: The prefix of official website. Any URLs starting with this prefix will be considered official.
+        append_location: Whether to put unofficial files in a ``thirdparty`` folder.
+
+    Returns:
+        The real path that this URL is mapped to.
+    """
     if not save_dir:
         save_dir = hanlp_home()
     domain, relative_path = parse_url_path(url)
@@ -393,84 +408,46 @@ def read_cells(filepath: str, delimiter='auto', strip=True, skip_header=False):
 
 
 def replace_ext(filepath, ext) -> str:
-    """
-    Replace the extension of filepath to ext
-    Parameters
-    ----------
-    filepath
-    ext
+    """ Replace the extension of filepath to ext.
 
-    Returns
-    -------
+    Args:
+        filepath: Filepath to be replaced.
+        ext: Extension to replace.
 
+    Returns:
+        A new path.
     """
     file_prefix, _ = os.path.splitext(filepath)
     return file_prefix + ext
 
 
-def load_word2vec(path, delimiter=' ', cache=True) -> Tuple[Dict[str, np.ndarray], int]:
-    realpath = get_resource(path)
-    binpath = replace_ext(realpath, '.pkl')
-    if cache:
-        try:
-            word2vec, dim = load_pickle(binpath)
-            logger.debug(f'Loaded {binpath}')
-            return word2vec, dim
-        except IOError:
-            pass
-
-    dim = None
-    word2vec = dict()
-    with open(realpath, encoding='utf-8', errors='ignore') as f:
-        for idx, line in enumerate(f):
-            line = line.rstrip().split(delimiter)
-            if len(line) > 2:
-                if dim is None:
-                    dim = len(line)
-                else:
-                    if len(line) != dim:
-                        logger.warning('{}#{} length mismatches with {}'.format(path, idx + 1, dim))
-                        continue
-                word, vec = line[0], line[1:]
-                word2vec[word] = np.array(vec, dtype=np.float32)
-    dim -= 1
-    if cache:
-        save_pickle((word2vec, dim), binpath)
-        logger.debug(f'Cached {binpath}')
-    return word2vec, dim
-
-
-def save_word2vec(word2vec: dict, filepath, delimiter=' '):
-    with open(filepath, 'w', encoding='utf-8') as out:
-        for w, v in word2vec.items():
-            out.write(f'{w}{delimiter}')
-            out.write(f'{delimiter.join(str(x) for x in v)}\n')
-
-
-def read_tsv(tsv_file_path):
+def read_tsv_as_sents(tsv_file_path, ignore_prefix=None, delimiter=None):
     sent = []
     tsv_file_path = get_resource(tsv_file_path)
     with open(tsv_file_path, encoding='utf-8') as tsv_file:
         for line in tsv_file:
-            cells = line.strip().split()
-            if cells:
-                # if len(cells) != 2:
-                #     print(line)
+            if ignore_prefix and line.startswith(ignore_prefix):
+                continue
+            line = line.strip()
+            cells = line.split(delimiter)
+            if line and cells:
                 sent.append(cells)
-            else:
+            elif sent:
                 yield sent
                 sent = []
     if sent:
         yield sent
 
 
-def generator_words_tags(tsv_file_path, lower=True, gold=True, max_seq_length=None):
-    for sent in read_tsv(tsv_file_path):
+def generate_words_tags_from_tsv(tsv_file_path, lower=False, gold=True, max_seq_length=None, sent_delimiter=None,
+                                 char_level=False, hard_constraint=False):
+    for sent in read_tsv_as_sents(tsv_file_path):
         words = [cells[0] for cells in sent]
-        if max_seq_length and len(words) > max_seq_length:
+        if max_seq_length:
             offset = 0
             # try to split the sequence to make it fit into max_seq_length
-            for shorter_words in split_long_sentence_into(words, max_seq_length):
+            for shorter_words in split_long_sentence_into(words, max_seq_length, sent_delimiter, char_level,
+                                                          hard_constraint):
                 if gold:
                     shorter_tags = [cells[1] for cells in sent[offset:offset + len(shorter_words)]]
                     offset += len(shorter_words)
@@ -481,7 +458,10 @@ def generator_words_tags(tsv_file_path, lower=True, gold=True, max_seq_length=No
                 yield shorter_words, shorter_tags
         else:
             if gold:
-                tags = [cells[1] for cells in sent]
+                try:
+                    tags = [cells[1] for cells in sent]
+                except:
+                    raise ValueError(f'Failed to load {tsv_file_path}: {sent}')
             else:
                 tags = None
             if lower:
@@ -489,12 +469,16 @@ def generator_words_tags(tsv_file_path, lower=True, gold=True, max_seq_length=No
             yield words, tags
 
 
-def split_file(filepath, train=0.8, valid=0.1, test=0.1, names=None, shuffle=False):
-    num_lines = 0
-    with open(filepath, encoding='utf-8') as src:
-        for line in src:
-            num_lines += 1
-    splits = {'train': train, 'valid': valid, 'test': test}
+def split_file(filepath, train=0.8, dev=0.1, test=0.1, names=None, shuffle=False):
+    num_samples = 0
+    if filepath.endswith('.tsv'):
+        for sent in read_tsv_as_sents(filepath):
+            num_samples += 1
+    else:
+        with open(filepath, encoding='utf-8') as src:
+            for sample in src:
+                num_samples += 1
+    splits = {'train': train, 'dev': dev, 'test': test}
     splits = dict((k, v) for k, v in splits.items() if v)
     splits = dict((k, v / sum(splits.values())) for k, v in splits.items())
     accumulated = 0
@@ -507,21 +491,30 @@ def split_file(filepath, train=0.8, valid=0.1, test=0.1, names=None, shuffle=Fal
     if names is None:
         names = {}
     name, ext = os.path.splitext(filepath)
-    outs = [open(names.get(split, name + '.' + split + ext), 'w', encoding='utf-8') for split in splits.keys()]
+    filenames = [names.get(split, name + '.' + split + ext) for split in splits.keys()]
+    outs = [open(f, 'w', encoding='utf-8') for f in filenames]
     if shuffle:
-        shuffle = list(range(num_lines))
+        shuffle = list(range(num_samples))
         random.shuffle(shuffle)
-    with open(filepath, encoding='utf-8') as src:
-        for idx, line in enumerate(src):
-            if shuffle:
-                idx = shuffle[idx]
-            ratio = idx / num_lines
-            for sid, out in enumerate(outs):
-                if r[2 * sid] <= ratio < r[2 * sid + 1]:
-                    out.write(line)
-                    break
+    if filepath.endswith('.tsv'):
+        src = read_tsv_as_sents(filepath)
+    else:
+        src = open(filepath, encoding='utf-8')
+    for idx, sample in enumerate(src):
+        if shuffle:
+            idx = shuffle[idx]
+        ratio = idx / num_samples
+        for sid, out in enumerate(outs):
+            if r[2 * sid] <= ratio < r[2 * sid + 1]:
+                if isinstance(sample, list):
+                    sample = '\n'.join('\t'.join(x) for x in sample) + '\n\n'
+                out.write(sample)
+                break
+    if not filepath.endswith('.tsv'):
+        src.close()
     for out in outs:
         out.close()
+    return filenames
 
 
 def fileno(file_or_fd):
@@ -536,13 +529,13 @@ def fileno(file_or_fd):
 
 @contextmanager
 def stdout_redirected(to=os.devnull, stdout=None):
-    """
-    Redirect stdout to else where
+    """Redirect stdout to else where.
     Copied from https://stackoverflow.com/questions/4675728/redirect-stdout-to-a-file-in-python/22434262#22434262
-    Parameters
-    ----------
-    to
-    stdout
+
+    Args:
+      to:  Target device.
+      stdout:  Source device.
+
     """
     if windows():  # This doesn't play well with windows
         yield None
@@ -573,3 +566,141 @@ def stdout_redirected(to=os.devnull, stdout=None):
             except:
                 # This is the best we can do
                 pass
+
+
+def get_exitcode_stdout_stderr(cmd):
+    """Execute the external command and get its exitcode, stdout and stderr.
+    See https://stackoverflow.com/a/21000308/3730690
+
+    Args:
+      cmd: Command.
+
+    Returns:
+        Exit code, stdout, stderr.
+    """
+    args = shlex.split(cmd)
+    proc = Popen(args, stdout=PIPE, stderr=PIPE)
+    out, err = proc.communicate()
+    exitcode = proc.returncode
+    return exitcode, out.decode('utf-8'), err.decode('utf-8')
+
+
+def run_cmd(cmd: str) -> str:
+    exitcode, out, err = get_exitcode_stdout_stderr(cmd)
+    if exitcode:
+        raise RuntimeError(err + '\nThe command is:\n' + cmd)
+    return out
+
+
+@contextlib.contextmanager
+def pushd(new_dir):
+    previous_dir = os.getcwd()
+    os.chdir(new_dir)
+    try:
+        yield
+    finally:
+        os.chdir(previous_dir)
+
+
+def basename_no_ext(path):
+    basename = os.path.basename(path)
+    no_ext, ext = os.path.splitext(basename)
+    return no_ext
+
+
+def file_cache(path: str, purge=False):
+    cache_name = path + '.cache'
+    cache_time = os.path.getmtime(cache_name) if os.path.isfile(cache_name) and not purge else 0
+    file_time = os.path.getmtime(path)
+    cache_valid = cache_time > file_time
+    return cache_name, cache_valid
+
+
+def merge_files(files: List[str], dst: str):
+    with open(dst, 'wb') as write:
+        for f in files:
+            with open(f, 'rb') as read:
+                shutil.copyfileobj(read, write)
+
+
+class TimingFileIterator(CountdownTimer):
+
+    def __init__(self, filepath) -> None:
+        super().__init__(os.path.getsize(filepath))
+        self.filepath = filepath
+
+    def __iter__(self):
+        if not os.path.isfile(self.filepath):
+            raise FileNotFoundError(self.filepath)
+        fp = open(self.filepath, encoding='utf-8', errors='ignore')
+        line = fp.readline()
+        while line:
+            yield line
+            self.current = fp.tell()
+            line = fp.readline()
+        fp.close()
+
+    def log(self, info=None, ratio_percentage=True, ratio=True, step=0, interval=0.5, erase=True,
+            logger: Union[logging.Logger, bool] = None, newline=False, ratio_width=None):
+        assert step == 0
+        super().log(info, ratio_percentage, ratio, step, interval, erase, logger, newline, ratio_width)
+
+    @property
+    def ratio(self) -> str:
+        return f'{human_bytes(self.current)}/{human_bytes(self.total)}'
+
+    @property
+    def ratio_width(self) -> int:
+        return len(f'{human_bytes(self.total)}') * 2 + 1
+
+    def close(self):
+        pass
+
+
+def check_outdated(package='hanlp', version=__version__, repository_url='https://pypi.python.org/pypi/%s/json'):
+    """Given the name of a package on PyPI and a version (both strings), checks
+    if the given version is the latest version of the package available.
+    Returns a 2-tuple (installed_version, latest_version)
+    `repository_url` is a `%` style format string
+    to use a different repository PyPI repository URL,
+    e.g. test.pypi.org or a private repository.
+    The string is formatted with the package name.
+    Adopted from https://github.com/alexmojaki/outdated/blob/master/outdated/__init__.py
+
+    Args:
+        package: Package name.
+        version: Installed version string.
+        repository_url: URL on pypi.
+
+    Returns:
+        Parsed installed version and latest version.
+    """
+    installed_version = parse_version(version)
+    latest_version = get_latest_info_from_pypi(package, repository_url)
+    return installed_version, latest_version
+
+
+def get_latest_info_from_pypi(package='hanlp', repository_url='https://pypi.python.org/pypi/%s/json'):
+    url = repository_url % package
+    response = urllib.request.urlopen(url).read()
+    return parse_version(json.loads(response)['info']['version'])
+
+
+def check_version_conflicts(extras=None):
+    from pkg_resources import get_distribution, Requirement, WorkingSet, VersionConflict, DistributionNotFound
+    pkg = get_distribution('hanlp')
+    if not extras:
+        extras = pkg.extras
+    if isinstance(extras, list):
+        extras = tuple(extras)
+    requirements: List[Requirement] = pkg.requires(extras=extras)
+    error = None
+    try:
+        WorkingSet().resolve(
+            requirements, extras=extras
+        )
+    except VersionConflict as e:
+        error = e.with_context('hanlp').report()
+    except DistributionNotFound as e:
+        error = str(e)
+    return error, extras
