@@ -1,16 +1,14 @@
 import re
 
-from hanlp.utils.english_tokenizer import tokenize_english
-
-SEPARATOR = r'@'
-RE_SENTENCE = re.compile(r'(\S.+?[.!?])(?=\s+|$)|(\S.+?)(?=[\n]|$)', re.UNICODE)
-AB_SENIOR = re.compile(r'([A-Z][a-z]{1,2}\.)\s(\w)', re.UNICODE)
-AB_ACRONYM = re.compile(r'(\.[a-zA-Z]\.)\s(\w)', re.UNICODE)
-UNDO_AB_SENIOR = re.compile(r'([A-Z][a-z]{1,2}\.)' + SEPARATOR + r'(\w)', re.UNICODE)
-UNDO_AB_ACRONYM = re.compile(r'(\.[a-zA-Z]\.)' + SEPARATOR + r'(\w)', re.UNICODE)
+_SEPARATOR = r'@'
+_RE_SENTENCE = re.compile(r'(\S.+?[.!?])(?=\s+|$)|(\S.+?)(?=[\n]|$)', re.UNICODE)
+_AB_SENIOR = re.compile(r'([A-Z][a-z]{1,2}\.)\s(\w)', re.UNICODE)
+_AB_ACRONYM = re.compile(r'(\.[a-zA-Z]\.)\s(\w)', re.UNICODE)
+_UNDO_AB_SENIOR = re.compile(r'([A-Z][a-z]{1,2}\.)' + _SEPARATOR + r'(\w)', re.UNICODE)
+_UNDO_AB_ACRONYM = re.compile(r'(\.[a-zA-Z]\.)' + _SEPARATOR + r'(\w)', re.UNICODE)
 
 
-def replace_with_separator(text, separator, regexs):
+def _replace_with_separator(text, separator, regexs):
     replacement = r"\1" + separator + r"\2"
     result = text
     for regex in regexs:
@@ -19,10 +17,10 @@ def replace_with_separator(text, separator, regexs):
 
 
 def split_sentence(text, best=True):
-    text = re.sub('([。！？\?])([^”’])', r"\1\n\2", text)
-    text = re.sub('(\.{6})([^”’])', r"\1\n\2", text)
-    text = re.sub('(\…{2})([^”’])', r"\1\n\2", text)
-    text = re.sub('([。！？\?][”’])([^，。！？\?])', r'\1\n\2', text)
+    text = re.sub(r'([。！？?])([^”’])', r"\1\n\2", text)
+    text = re.sub(r'(\.{6})([^”’])', r"\1\n\2", text)
+    text = re.sub(r'(…{2})([^”’])', r"\1\n\2", text)
+    text = re.sub(r'([。！？?][”’])([^，。！？?])', r'\1\n\2', text)
     for chunk in text.split("\n"):
         chunk = chunk.strip()
         if not chunk:
@@ -30,9 +28,13 @@ def split_sentence(text, best=True):
         if not best:
             yield chunk
             continue
-        processed = replace_with_separator(chunk, SEPARATOR, [AB_SENIOR, AB_ACRONYM])
-        for sentence in RE_SENTENCE.finditer(processed):
-            sentence = replace_with_separator(sentence.group(), r" ", [UNDO_AB_SENIOR, UNDO_AB_ACRONYM])
+        processed = _replace_with_separator(chunk, _SEPARATOR, [_AB_SENIOR, _AB_ACRONYM])
+        sents = list(_RE_SENTENCE.finditer(processed))
+        if not sents:
+            yield chunk
+            continue
+        for sentence in sents:
+            sentence = _replace_with_separator(sentence.group(), r" ", [_UNDO_AB_SENIOR, _UNDO_AB_ACRONYM])
             yield sentence
 
 
